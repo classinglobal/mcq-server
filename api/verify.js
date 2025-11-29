@@ -7,29 +7,36 @@ module.exports = async (req, res) => {
     }
 
     try {
-        // 🔥 SUPER IMPORTANT: ALWAYS READ RAW BODY ON VERCEL
-        let rawBody = '';
-
-        await new Promise((resolve) => {
-            req.on('data', chunk => rawBody += chunk);
+        // ----------- SUPER IMPORTANT -------------
+        // Vercel never gives req.body
+        // we must manually read raw body
+        // -----------------------------------------
+        let raw = '';
+        await new Promise(resolve => {
+            req.on('data', chunk => raw += chunk);
             req.on('end', resolve);
         });
 
+        console.log("📥 RAW RECEIVED:", raw);
+
         let data;
         try {
-            data = JSON.parse(rawBody);
+            data = JSON.parse(raw);
         } catch (e) {
             console.error("JSON Parse Error:", e.message);
-            return res.status(400).json({ error: "Invalid JSON from App" });
+            return res.status(400).json({ error: "Invalid JSON" });
         }
 
-        console.log("Received Body:", data);
+        const { packageName, token, subscriptionId, userId } = data || {};
 
-        // 🔐 ENV Check
-        if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON || !process.env.PLAY_SERVICE_ACCOUNT_JSON) {
-            throw new Error("MISSING_SERVER_KEYS");
+        if (!packageName || !token || !subscriptionId || !userId) {
+            console.error("❌ MISSING PARAMS:", data);
+            return res.status(400).json({
+                error: 'Missing required parameters: packageName, token'
+            });
         }
 
+        // ENV
         const firebaseCreds = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
         const playCreds = JSON.parse(process.env.PLAY_SERVICE_ACCOUNT_JSON);
 
@@ -43,22 +50,15 @@ module.exports = async (req, res) => {
             credentials: playCreds,
             scopes: ['https://www.googleapis.com/auth/androidpublisher'],
         });
+
         const publisher = google.androidpublisher({ version: 'v3', auth });
 
-        // 🟢 Extract params correctly
-        const { packageName, token, subscriptionId, userId } = data;
-
-        if (!packageName || !token || !subscriptionId || !userId) {
-            console.error("Missing Fields:", data);
-            return res.status(400).json({ error: 'Missing required parameters: packageName, token' });
-        }
-
-        // 🟢 Google Play API call
-        const resp = await publisher.purchases.subscriptionsv2.get({
+        // Google Play Verification
+        const response = await publisher.purchases.subscriptionsv2.get({
             name: `applications/${packageName}/purchases/subscriptionsv2/tokens/${token}`
         });
 
-        const sub = resp.data;
+        const sub = response.data;
         const expiryMillis =
             sub?.subscriptionPurchase?.expiryTimeMillis ||
             sub?.expiryTimeMillis || 0;
@@ -67,37 +67,21 @@ module.exports = async (req, res) => {
         const isExpired = expiryTime <= Date.now();
         const isActive = sub.subscriptionState === 'SUBSCRIPTION_STATE_ACTIVE';
 
-        const userRef = db.collection('profile').doc(userId);
+        await db.collection('profile').doc(userId).set({
+            premiumPlan: isActive && !isExpired,
+            premiumExpiry: expiryTime,
+            lastVerified: Date.now(),
+            lastSubId: subscriptionId
+        }, { merge: true });
 
-        if (isActive && !isExpired) {
-            await userRef.set({
-                premiumPlan: true,
-                premiumExpiry: expiryTime,
-                lastVerified: Date.now(),
-                lastSubId: subscriptionId
-            }, { merge: true });
-
-            return res.status(200).json({
-                ok: true,
-                active: true,
-                expiryMillis: expiryTime
-            });
-        } else {
-            await userRef.set({
-                premiumPlan: false,
-                premiumExpiry: expiryTime
-            }, { merge: true });
-
-            return res.status(200).json({
-                ok: true,
-                active: false,
-                reason: 'Inactive'
-            });
-        }
+        return res.status(200).json({
+            ok: true,
+            active: isActive && !isExpired,
+            expiryMillis: expiryTime
+        });
 
     } catch (e) {
-        console.error("CRASH:", e.message);
-        if (e.response?.data) console.error("Google API:", e.response.data);
+        console.error("SERVER ERROR:", e.message);
         return res.status(500).json({ error: e.message });
     }
 };
