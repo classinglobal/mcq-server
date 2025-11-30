@@ -1,122 +1,121 @@
-import { NextResponse } from "next/server";
-import admin from "@/lib/firebaseAdmin"; // আপনার Firebase Admin সেটআপ
-import { google } from "googleapis";
+const { google } = require('googleapis');
+const admin = require('firebase-admin');
 
-export async function POST(req) {
-  try {
-    // -------------------------
-    // STEP 1: Read request body
-    // -------------------------
-    const body = await req.json();
-    const { userId, packageName, token, subscriptionId } = body || {};
-
-    console.log(`🚀 Verify Request: User=${userId}, Pkg=${packageName}, SubId=${subscriptionId}`);
-
-    // Missing check
-    if (!packageName || !token || !userId || !subscriptionId) {
-      console.error("❌ Missing required parameters");
-      return NextResponse.json(
-        { success: false, message: "Missing required parameters" },
-        { status: 400 }
-      );
+module.exports = async (req, res) => {
+    // ১. মেথড চেক
+    if (req.method !== 'POST') {
+        return res.status(405).json({ error: 'Method Not Allowed' });
     }
 
-    // --------------------------
-    // STEP 2: Google Play Verify (Using Official googleapis)
-    // --------------------------
-    
-    // Environment Variables থেকে চাবি নেওয়া
-    const clientEmail = process.env.GOOGLE_CLIENT_EMAIL;
-    const privateKey = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, "\n");
+    try {
+        // ২. বডি পার্সিং (Body Parsing) - এটি খুবই গুরুত্বপূর্ণ
+        // অনেক সময় Android থেকে ডাটা স্ট্রিং হিসেবে আসে
+        let data = req.body;
+        
+        // ডিবাগিং লগ: ঠিক কী ডাটা এসেছে তা দেখার জন্য
+        console.log("📥 Raw Body Type:", typeof data);
+        if (typeof data === 'string') {
+            try {
+                data = JSON.parse(data);
+                console.log("✅ Parsed JSON Body successfully");
+            } catch (e) {
+                console.error("❌ JSON Parse Error:", e.message);
+                return res.status(400).json({ error: "Invalid JSON format sent from App" });
+            }
+        }
 
-    if (!clientEmail || !privateKey) {
-        throw new Error("Server Credentials Missing (GOOGLE_CLIENT_EMAIL or GOOGLE_PRIVATE_KEY)");
+        // ৩. ডাটা ভেরিয়েবল
+        const { packageName, token, subscriptionId, userId } = data || {};
+
+        console.log(`🔍 Received: User=${userId}, Pkg=${packageName}, SubId=${subscriptionId}, TokenLength=${token ? token.length : 'MISSING'}`);
+
+        // ৪. মিসিং প্যারামিটার চেক (সুনির্দিষ্ট এরর মেসেজ সহ)
+        const missingFields = [];
+        if (!packageName) missingFields.push('packageName');
+        if (!token) missingFields.push('token');
+        if (!subscriptionId) missingFields.push('subscriptionId');
+        if (!userId) missingFields.push('userId');
+
+        if (missingFields.length > 0) {
+            console.error("🔴 Missing Fields:", missingFields.join(', '));
+            return res.status(400).json({ 
+                error: `Missing required parameters: ${missingFields.join(', ')}`,
+                received: data 
+            });
+        }
+
+        // ৫. চাবি (Keys) লোড করা (আপনার অনুরোধ অনুযায়ী আগের নিয়মে)
+        let firebaseCreds, playCreds;
+        try {
+            if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON is undefined");
+            firebaseCreds = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+        } catch (e) {
+            throw new Error(`Firebase Key Error: ${e.message}`);
+        }
+
+        try {
+            if (!process.env.PLAY_SERVICE_ACCOUNT_JSON) throw new Error("PLAY_SERVICE_ACCOUNT_JSON is undefined");
+            playCreds = JSON.parse(process.env.PLAY_SERVICE_ACCOUNT_JSON);
+        } catch (e) {
+            throw new Error(`Google Play Key Error: ${e.message}`);
+        }
+
+        // ৬. Firebase কানেকশন
+        if (admin.apps.length === 0) {
+            admin.initializeApp({
+                credential: admin.credential.cert(firebaseCreds)
+            });
+        }
+        const db = admin.firestore();
+
+        // ৭. Google Play কানেকশন
+        const auth = new google.auth.GoogleAuth({
+            credentials: playCreds,
+            scopes: ['https://www.googleapis.com/auth/androidpublisher'],
+        });
+        const androidpublisher = google.androidpublisher({ version: 'v3', auth });
+
+        // ৮. ভেরিফিকেশন কল
+        console.log("🔄 Calling Google Play API...");
+        const response = await androidpublisher.purchases.subscriptionsv2.get({
+            name: `applications/${packageName}/purchases/subscriptionsv2/tokens/${token}`
+        });
+
+        const subData = response.data;
+        const expiryMillis = subData?.subscriptionPurchase?.expiryTimeMillis || subData?.expiryTimeMillis;
+        const expiryTime = expiryMillis ? Number(expiryMillis) : 0;
+        const isActiveSub = subData.subscriptionState === 'SUBSCRIPTION_STATE_ACTIVE';
+        const isExpired = expiryTime <= Date.now();
+
+        // ৯. Firestore আপডেট (profile কালেকশন)
+        const userDocRef = db.collection('profile').doc(userId);
+
+        if (isActiveSub && !isExpired) {
+            await userDocRef.set({
+                premiumPlan: true, 
+                premiumExpiry: expiryTime,
+                lastVerified: Date.now(),
+                lastSubId: subscriptionId
+            }, { merge: true });
+            
+            console.log(`✅ Success: Premium activated for ${userId}`);
+            return res.status(200).json({ ok: true, active: true, expiryMillis: expiryTime });
+
+        } else {
+            await userDocRef.set({ 
+                premiumPlan: false,
+                premiumExpiry: expiryTime
+            }, { merge: true });
+            
+            console.log(`❌ Inactive: Subscription not valid for ${userId}`);
+            return res.status(200).json({ ok: true, active: false, reason: 'Inactive or Expired' });
+        }
+
+    } catch (e) {
+        console.error("🔴 SERVER CRASH:", e.message);
+        if (e.response && e.response.data) {
+            console.error("Google API Error:", JSON.stringify(e.response.data));
+        }
+        return res.status(500).json({ error: e.message });
     }
-
-    // Auth Client তৈরি করা
-    const auth = new google.auth.JWT({
-      email: clientEmail,
-      key: privateKey,
-      scopes: ["https://www.googleapis.com/auth/androidpublisher"],
-    });
-
-    const androidpublisher = google.androidpublisher({
-      version: "v3",
-      auth: auth,
-    });
-
-    // ভেরিফিকেশন কল
-    console.log("⏳ Verifying with Google...");
-    const response = await androidpublisher.purchases.subscriptionsv2.get({
-      packageName: packageName,
-      token: token,
-    });
-
-    const subData = response.data;
-    
-    // স্ট্যাটাস চেক
-    const isActive = subData.subscriptionState === "SUBSCRIPTION_STATE_ACTIVE";
-    // মেয়াদ শেষ হওয়ার সময় (Expiry Time)
-    const expiryMillis = subData.subscriptionPurchase?.expiryTimeMillis || subData.expiryTimeMillis;
-    const expiryTime = expiryMillis ? Number(expiryMillis) : 0;
-    const isExpired = expiryTime <= Date.now();
-
-    // -----------------------------
-    // STEP 3: Update Firestore
-    // -----------------------------
-    const db = admin.firestore();
-    const userRef = db.collection("profile").doc(userId);
-
-    if (isActive && !isExpired) {
-      // ✅ সফল: premiumPlan নাম ব্যবহার করা হয়েছে এবং merge: true দেওয়া হয়েছে
-      await userRef.set({
-        premiumPlan: true, 
-        premiumExpiry: expiryTime,
-        lastVerified: Date.now(),
-        lastSubId: subscriptionId
-      }, { merge: true });
-
-      console.log(`✔ Success: Premium activated for ${userId}`);
-
-      return NextResponse.json({
-        ok: true, // অ্যাপ এই ফিল্ড চেক করে
-        active: true,
-        expiryMillis: expiryTime,
-        success: true
-      });
-
-    } else {
-      // ❌ মেয়াদ শেষ
-      await userRef.set({
-        premiumPlan: false,
-        premiumExpiry: expiryTime
-      }, { merge: true });
-
-      console.log(`❌ Subscription inactive/expired for ${userId}`);
-
-      return NextResponse.json({
-        ok: true, 
-        active: false,
-        reason: "Inactive or Expired",
-        success: true
-      });
-    }
-
-  } catch (error) {
-    console.error("🔥 SERVER ERROR:", error.message);
-    
-    // Google API Error ডিটেইলস দেখার জন্য
-    if (error.response) {
-        console.error("Google API Error:", JSON.stringify(error.response.data));
-    }
-
-    return NextResponse.json(
-      {
-        success: false,
-        message: "Server error",
-        error: error.message,
-      },
-      { status: 500 }
-    );
-  }
-}
+};
