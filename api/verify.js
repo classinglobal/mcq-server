@@ -8,10 +8,8 @@ module.exports = async (req, res) => {
     }
 
     try {
-        // ২. ডাটা রিসিভ ও পার্স করা
+        // ২. ডাটা পার্সিং
         let data = req.body;
-        
-        // যদি স্ট্রিং হিসেবে আসে, জেসন বানাও
         if (typeof data === 'string') {
             try {
                 data = JSON.parse(data);
@@ -20,38 +18,28 @@ module.exports = async (req, res) => {
             }
         }
 
-        // ৩. ভেরিয়েবল আলাদা করা
         const packageName = data.packageName;
         const token = data.token;
         const subscriptionId = data.subscriptionId;
         const userId = data.userId;
 
-        // ৪. ডিবাগ লগ (Vercel লগে দেখার জন্য)
-        console.log("--- FINAL CHECK ---");
-        console.log(`PKG: ${packageName}`);
-        console.log(`SUB: ${subscriptionId}`);
-        console.log(`USR: ${userId}`);
-        console.log(`TOK: ${token ? token.substring(0, 20) + '...' : 'MISSING'}`);
-        console.log("-------------------");
+        // ৩. লগ চেক (Vercel-এ দেখার জন্য)
+        console.log(`🔍 Processing for: ${userId} | Pkg: ${packageName} | Sub: ${subscriptionId}`);
 
-        // ৫. ভ্যালিডেশন (সঠিক ভেরিয়েবল চেক)
         if (!packageName || !token || !subscriptionId || !userId) {
-            console.error("🔴 Validation Failed!");
-            return res.status(400).json({ 
-                error: 'Missing required parameters',
-                details: `Received: Pkg=${!!packageName}, Tok=${!!token}, Sub=${!!subscriptionId}, User=${!!userId}`
-            });
+            console.error("🔴 Validation Failed: Missing fields");
+            return res.status(400).json({ error: 'Missing required parameters' });
         }
 
-        // ৬. চাবি (Keys) লোড করা
+        // ৪. চাবি লোড করা
         if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON || !process.env.PLAY_SERVICE_ACCOUNT_JSON) {
-            throw new Error("SERVER_KEYS_MISSING_IN_ENV");
+            throw new Error("SERVER_KEYS_MISSING");
         }
 
         const firebaseCreds = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
         const playCreds = JSON.parse(process.env.PLAY_SERVICE_ACCOUNT_JSON);
 
-        // ৭. কানেকশন সেটআপ
+        // ৫. কানেকশন
         if (admin.apps.length === 0) {
             admin.initializeApp({ credential: admin.credential.cert(firebaseCreds) });
         }
@@ -63,26 +51,36 @@ module.exports = async (req, res) => {
         });
         const androidpublisher = google.androidpublisher({ version: 'v3', auth });
 
-        // ৮. Google Play ভেরিফিকেশন (আসল কাজ)
-        console.log("🔄 Calling Google API...");
+        // ৬. ভেরিফিকেশন কল (✅ এখানে পরিবর্তন করা হয়েছে ✅)
+        // আমরা v2 এর বদলে স্ট্যান্ডার্ড এবং স্ট্যাবল v1 মেথড ব্যবহার করছি
+        // এটি সরাসরি প্যারামিটার গ্রহণ করে, তাই "Missing parameters" এরর দেবে না
+        console.log("🔄 Calling Google API (Standard Method)...");
         
-        const response = await androidpublisher.purchases.subscriptionsv2.get({
-            name: `applications/${packageName}/purchases/subscriptionsv2/tokens/${token}`
+        const response = await androidpublisher.purchases.subscriptions.get({
+            packageName: packageName,
+            subscriptionId: subscriptionId,
+            token: token
         });
 
         console.log("✅ Google API Response: Success");
 
         const subData = response.data;
         
-        // ৯. লজিক ও ডেটাবেস আপডেট
-        const expiryMillis = subData?.subscriptionPurchase?.expiryTimeMillis || subData?.expiryTimeMillis;
+        // ৭. স্ট্যাটাস এবং মেয়াদ চেক
+        // Google Play v1 API সরাসরি expiryTimeMillis রিটার্ন করে
+        const expiryMillis = subData.expiryTimeMillis;
         const expiryTime = expiryMillis ? Number(expiryMillis) : 0;
-        const isActiveSub = subData.subscriptionState === 'SUBSCRIPTION_STATE_ACTIVE';
+        
+        // পেমেন্ট স্টেট চেক (null মানে কোনো পেমেন্ট নেই)
+        // paymentState 1 = Payment Received, 0 = Pending/Trial (কিন্তু Active হতে পারে)
+        // তাই আমরা শুধু মেয়াদ (Expiry) চেক করব, এটাই সবচেয়ে নির্ভরযোগ্য
         const isExpired = expiryTime <= Date.now();
-
+        
+        // ৮. ডাটাবেস আপডেট
         const userDocRef = db.collection('profile').doc(userId);
 
-        if (isActiveSub && !isExpired) {
+        if (!isExpired) {
+            // মেয়াদ আছে = প্রিমিয়াম অ্যাক্টিভ
             await userDocRef.set({
                 premiumPlan: true, 
                 premiumExpiry: expiryTime,
@@ -90,22 +88,22 @@ module.exports = async (req, res) => {
                 lastSubId: subscriptionId
             }, { merge: true });
             
-            console.log(`🎉 Activated Premium for ${userId}`);
+            console.log(`🎉 Premium Activated for ${userId}`);
             return res.status(200).json({ ok: true, active: true, expiryMillis: expiryTime });
 
         } else {
+            // মেয়াদ শেষ
             await userDocRef.set({ 
                 premiumPlan: false,
                 premiumExpiry: expiryTime
             }, { merge: true });
             
-            console.log(`⛔ Expired/Inactive for ${userId}`);
-            return res.status(200).json({ ok: true, active: false, reason: 'Inactive' });
+            console.log(`⛔ Expired subscription for ${userId}`);
+            return res.status(200).json({ ok: true, active: false, reason: 'Expired' });
         }
 
     } catch (e) {
         console.error("🔴 SERVER ERROR:", e.message);
-        // Google API-এর বিস্তারিত এরর
         if (e.response && e.response.data) {
             console.error("Google Error Details:", JSON.stringify(e.response.data));
         }
